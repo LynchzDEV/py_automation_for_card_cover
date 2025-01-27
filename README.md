@@ -2,6 +2,8 @@
 
 A Python script that processes images (e.g., .png, .jpg, .jpeg) by **extending** the edges with a bottom-based color and optionally a white border, then arranges them into a **90×90 cm** collage. Finally, it exports the collage in one of several formats: **PNG**, **PDF**, **SVG**, or **AI**.
 
+**AI FORMAT IS NOT CURRENTLY WORKING, NOR IT WILL**
+
 ## Features
 
 1. **Edge Extension**
