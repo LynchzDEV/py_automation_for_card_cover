@@ -1,10 +1,14 @@
 import os
+import sys
+import argparse
 from PIL import Image, ImageOps
 from collections import Counter
 
-#-------------------------#
-# GLOBAL CONSTANTS #
-#-------------------------#
+# ------------------------- #
+# GLOBAL CONSTANTS          #
+# ------------------------- #
+
+AVERAGE_COLOR = False
 
 DPI = 300
 CM_TO_PX = lambda cm: round(cm * (DPI / 2.54))
@@ -22,116 +26,210 @@ IMAGE_HEIGHT_CM = 8.56
 EXTEND_COLOR_CM = 0.15
 WHITE_BORDER_CM = 0.00
 
+EXTEND_TOP_BOTTOM = 30
+EXTEND_LEFT_RIGHT = 15
+
 BASE_IMAGE_WIDTH_PX = CM_TO_PX(IMAGE_WIDTH_CM)
 BASE_IMAGE_HEIGHT_PX = CM_TO_PX(IMAGE_HEIGHT_CM)
 EXTEND_COLOR_PX = CM_TO_PX(EXTEND_COLOR_CM)
 WHITE_BORDER_PX = CM_TO_PX(WHITE_BORDER_CM)
 
-DESIGN_FINAL_WIDTH_PX = BASE_IMAGE_WIDTH_PX + 2 * (EXTEND_COLOR_PX + WHITE_BORDER_PX)
-DESIGN_FINAL_HEIGHT_PX = BASE_IMAGE_HEIGHT_PX + 2 * (EXTEND_COLOR_PX + WHITE_BORDER_PX)
+DESIGN_FINAL_WIDTH_PX = (
+    BASE_IMAGE_WIDTH_PX + 2 * (EXTEND_COLOR_PX + WHITE_BORDER_PX)
+)
+DESIGN_FINAL_HEIGHT_PX = (
+    BASE_IMAGE_HEIGHT_PX + 2 * (EXTEND_COLOR_PX + WHITE_BORDER_PX)
+)
 
-OUTPUT_FORMAT = "png"  # Options: "png", "pdf", "svg"
 
-#-------------------------#
-#  IMAGE PROCESSING STEP  #
-#-------------------------#
+# ------------------------- #
+# HELPER: GET BOTTOM AVG    #
+# ------------------------- #
 
-def get_primary_color(image):
+def get_bottom_average_color(image, strip_height=1):
     """
-    Get the most common color in the image excluding white.
+    Return the average color (R, G, B) of the bottom strip
+    of `strip_height` pixels.
     """
     image = image.convert('RGB')
-    pixels = list(image.getdata())
-    non_white_pixels = [pixel for pixel in pixels if pixel != (255, 255, 255)]
-    most_common_color = Counter(non_white_pixels).most_common(1)[0][0]
+    bottom_strip = image.crop(
+        (0, image.height - strip_height, image.width, image.height)
+    )
+    pixels = list(bottom_strip.getdata())
+
+    num_pixels = len(pixels)
+    if num_pixels == 0:
+        return (255, 255, 255)  # fallback
+
+    sum_r = sum(p[0] for p in pixels)
+    sum_g = sum(p[1] for p in pixels)
+    sum_b = sum(p[2] for p in pixels)
+
+    avg_r = sum_r // num_pixels
+    avg_g = sum_g // num_pixels
+    avg_b = sum_b // num_pixels
+
+    return (avg_r, avg_g, avg_b)
+
+
+def get_bottom_color(image, strip_height=1):
+    """
+    Return the most common color in the bottom strip (height = strip_height pixels).
+    If it turns out to be all white, default to white.
+    """
+    image = image.convert('RGB')
+
+    bottom_strip = image.crop(
+        (0, image.height - strip_height, image.width, image.height)
+    )
+    pixels = list(bottom_strip.getdata())
+
+    non_white_pixels = [p for p in pixels if p != (255, 255, 255)]
+    if non_white_pixels:
+        most_common_color = Counter(non_white_pixels).most_common(1)[0][0]
+    else:
+        most_common_color = (255, 255, 255)
+
     return most_common_color
+
+
+# ------------------------- #
+#  IMAGE PROCESSING STEP    #
+# ------------------------- #
 
 def process_image(file_path):
     """
-    Process an image by extending edges, adding a white border,
-    and resizing it to the design dimension.
+    Process each image by extending top/bottom + left/right with
+    a color based on the bottom strip of the original image.
+    Then optionally add a white border, then resize.
     """
-    # Open the image
     image = Image.open(file_path)
 
-    # Step 1: Extend edges with the background color
-    primary_color = get_primary_color(image)
-    total_pixels = image.width * image.height
-    white_pixels = sum(1 for pixel in image.getdata() if pixel == (255, 255, 255))
+    # Choose either average color or most common color:
+    if AVERAGE_COLOR:
+        bottom_avg_color = get_bottom_average_color(image, strip_height=5)
+    else:
+        bottom_avg_color = get_bottom_color(image, strip_height=5)
 
-    if white_pixels / total_pixels > 0.8:
-        primary_color = (255, 255, 255)
+    extended_image = ImageOps.expand(
+        image,
+        border=(EXTEND_LEFT_RIGHT, EXTEND_TOP_BOTTOM, EXTEND_LEFT_RIGHT, EXTEND_TOP_BOTTOM),
+        fill=bottom_avg_color
+    )
 
-    extended_image = ImageOps.expand(image, border=EXTEND_COLOR_PX, fill=primary_color[0])
+    if WHITE_BORDER_PX > 0:
+        extended_image = ImageOps.expand(extended_image, border=WHITE_BORDER_PX, fill='white')
 
-    # Step 2: Add a white border
-    final_image = ImageOps.expand(extended_image, border=WHITE_BORDER_PX, fill=255)
-
-    # Step 3: Resize to the design final dimension
-    resized = final_image.resize((DESIGN_FINAL_WIDTH_PX, DESIGN_FINAL_HEIGHT_PX), Image.Resampling.LANCZOS)
-
+    # Resize to final dimension
+    # (If you use ImageOps.fit here, it may crop. We'll do a simple resize.)
+    resized = extended_image.resize(
+        (DESIGN_FINAL_WIDTH_PX, DESIGN_FINAL_HEIGHT_PX),
+        Image.Resampling.LANCZOS
+    )
     return resized
 
-#-------------------------#
-#  FINAL COLLAGE CREATION #
-#-------------------------#
 
-def create_collage(processed_images, canvas_index):
+# ------------------------- #
+#  FINAL COLLAGE CREATION   #
+# ------------------------- #
+
+def create_collage(processed_images, canvas_index, output_format):
     """
     Arrange processed images on a 90x90 cm canvas in a grid.
+    Then export based on the chosen output_format.
     """
-    if OUTPUT_FORMAT in ["png", "pdf"]:
-        # Create a blank canvas
-        canvas = Image.new("RGB", (CANVAS_SIZE, CANVAS_SIZE), (255, 255, 255))
+    canvas = Image.new("RGB", (CANVAS_SIZE, CANVAS_SIZE), (255, 255, 255))
 
-        for i, img in enumerate(processed_images):
-            row = i // COLUMNS
-            col = i % COLUMNS
+    for i, img in enumerate(processed_images):
+        row = i // COLUMNS
+        col = i % COLUMNS
+        x = col * CELL_WIDTH
+        y = row * CELL_HEIGHT
 
-            x = col * CELL_WIDTH
-            y = row * CELL_HEIGHT
+        # Fill the cell entirely by cropping if needed
+        fitted_img = ImageOps.fit(
+            img,
+            (CELL_WIDTH, CELL_HEIGHT),
+            method=Image.Resampling.LANCZOS,
+            centering=(0.5, 0.5)
+        )
+        canvas.paste(fitted_img, (x, y))
 
-            # Resize image to fit the cell size
-            img = ImageOps.contain(img, (CELL_WIDTH, CELL_HEIGHT))
+    # Determine output path based on format
+    base_name = f"final_canvas_{canvas_index}"
+    if output_format == "png":
+        out_path = os.path.join("output", base_name + ".png")
+        canvas.save(out_path, "PNG")
+    elif output_format == "pdf":
+        out_path = os.path.join("output", base_name + ".pdf")
+        canvas.save(out_path, "PDF", resolution=300)
+    elif output_format == "svg":
+        png_path = os.path.join("output", base_name + "_temp.png")
+        canvas.save(png_path, "PNG")
 
-            # Paste the image onto the canvas
-            canvas.paste(img, (x, y))
+        svg_path = os.path.join("output", base_name + ".svg")
+        embed_png_in_svg(png_path, svg_path, canvas.width, canvas.height)
 
-        # Save the final canvas
-        output_path = os.path.join("output", f"final_canvas_{canvas_index}.{OUTPUT_FORMAT}")
-        os.makedirs("output", exist_ok=True)
-        if OUTPUT_FORMAT == "png":
-            canvas.save(output_path)
-        elif OUTPUT_FORMAT == "pdf":
-            canvas.save(output_path, "PDF", resolution=DPI)
-        print(f"Collage created successfully at {output_path}.")
+        os.remove(png_path)
+        out_path = svg_path
+    elif output_format == "ai":
+        out_path = os.path.join("output", base_name + ".eps")
+        canvas.save(out_path, "EPS")
+    else:
+        # Default fallback
+        out_path = os.path.join("output", base_name + ".png")
+        canvas.save(out_path, "PNG")
 
-    # elif OUTPUT_FORMAT == "svg":
-    #     dwg = svgwrite.Drawing(os.path.join("output", f"final_canvas_{canvas_index}.svg"), size=(CANVAS_SIZE, CANVAS_SIZE))
-    #     for i, img in enumerate(processed_images):
-    #         row = i // COLUMNS
-    #         col = i % COLUMNS
+    print(f"Collage created successfully at {out_path}.")
 
-    #         x = col * CELL_WIDTH
-    #         y = row * CELL_HEIGHT
 
-    #         # Resize image to fit the cell size
-    #         img = ImageOps.contain(img, (CELL_WIDTH, CELL_HEIGHT))
-    #         img_path = os.path.join("output", f"temp_image_{i}.png")
-    #         img.save(img_path)
+def embed_png_in_svg(png_path, svg_path, width_px, height_px):
+    """
+    Minimal function to embed a PNG in an SVG.
+    This is not a true vector conversion — just a raster data embed.
+    """
+    import base64
 
-    #         # Add image to SVG
-    #         dwg.add(dwg.image(img_path, insert=(x, y), size=(CELL_WIDTH, CELL_HEIGHT)))
+    with open(png_path, "rb") as f:
+        encoded = base64.b64encode(f.read()).decode("ascii")
 
-    #     dwg.save()
-    #     print(f"Collage created successfully at {os.path.join('output', f'final_canvas_{canvas_index}.svg')}.")
+    # For a 300 DPI image, 1 inch = 300 px. If you want real size in mm/cm,
+    # you'd do some calculations. We'll just put the same px as the <svg width/height>.
+    svg_content = f"""<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<svg
+    xmlns="http://www.w3.org/2000/svg"
+    width="{width_px}"
+    height="{height_px}"
+    version="1.1">
+  <image href="data:image/png;base64,{encoded}"
+         x="0" y="0"
+         width="{width_px}"
+         height="{height_px}" />
+</svg>
+"""
+    with open(svg_path, "w", encoding="utf-8") as svg_file:
+        svg_file.write(svg_content)
 
-#-------------------------#
-#         MAIN APP        #
-#-------------------------#
+
+# ------------------------- #
+#         MAIN APP          #
+# ------------------------- #
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Create collage and export in various formats.")
+    parser.add_argument(
+        "--format",
+        choices=["png", "pdf", "svg", "ai"],
+        default="png",
+        help="Output format (png, pdf, svg, ai). Default is png."
+    )
+    return parser.parse_args()
 
 def main():
     try:
+        args = parse_args()
+        output_format = args.format
+
         input_dir = "images"
         output_dir = "output"
 
@@ -150,10 +248,15 @@ def main():
         # Create and save the final collage(s)
         max_images_per_canvas = COLUMNS * ROWS
         for i in range(0, len(processed_images), max_images_per_canvas):
-            create_collage(processed_images[i:i + max_images_per_canvas], i // max_images_per_canvas)
+            create_collage(
+                processed_images[i:i + max_images_per_canvas],
+                i // max_images_per_canvas,
+                output_format
+            )
 
     except Exception as e:
         print(f"Error: {e}")
+
 
 if __name__ == "__main__":
     main()
